@@ -1,0 +1,7 @@
+build/
+dist/
+*.o
+*.so
+*.dll
+*.exe
+!project-stub/**/*.dll
