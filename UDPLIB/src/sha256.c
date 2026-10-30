@@ -1,7 +1,18 @@
-/* Минимальная реализация SHA-256 (FIPS 180-4), общая для udplib и prepatcher. */
+/* ============================================================
+ *  sha256.c - компиляционный модуль эталонного SHA-256 (FIPS 180-4).
+ *  Реализация находится в sha256_impl.inc - она общая для
+ *  udplib.so / udplib.dll и prepatcher, чтобы хэши совпадали 1:1.
+ * ============================================================ */
 #include "sha256.h"
-
 #include <string.h>
+
+#define SHA256_ROTR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SHA256_CH(x,y,z)  (((x) & (y)) ^ (~(x) & (z)))
+#define SHA256_MAJ(x,y,z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define SHA256_EP0(x) (SHA256_ROTR(x,2) ^ SHA256_ROTR(x,13) ^ SHA256_ROTR(x,22))
+#define SHA256_EP1(x) (SHA256_ROTR(x,6) ^ SHA256_ROTR(x,11) ^ SHA256_ROTR(x,25))
+#define SHA256_SIG0(x) (SHA256_ROTR(x,7) ^ SHA256_ROTR(x,18) ^ ((x) >> 3))
+#define SHA256_SIG1(x) (SHA256_ROTR(x,17) ^ SHA256_ROTR(x,19) ^ ((x) >> 10))
 
 static const uint32_t K[64] = {
     0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
@@ -14,81 +25,59 @@ static const uint32_t K[64] = {
     0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
 };
 
-#define ROTR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
-#define CH(x,y,z)  (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x,y,z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTR(x,2) ^ ROTR(x,13) ^ ROTR(x,22))
-#define EP1(x) (ROTR(x,6) ^ ROTR(x,11) ^ ROTR(x,25))
-#define SIG0(x) (ROTR(x,7) ^ ROTR(x,18) ^ ((x) >> 3))
-#define SIG1(x) (ROTR(x,17) ^ ROTR(x,19) ^ ((x) >> 10))
-
-static void sha256_transform(udplib_sha256_ctx* ctx, const uint8_t block[64]) {
+static void transform(udplib_sha256_ctx* ctx, const uint8_t block[64]) {
     uint32_t w[64], a, b, c, d, e, f, g, h, t1, t2;
     int i;
-    for (i = 0; i < 16; ++i) {
-        w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
-               ((uint32_t)block[i * 4 + 2] << 8) | (uint32_t)block[i * 4 + 3];
-    }
-    for (; i < 64; ++i) w[i] = SIG1(w[i-14]) + w[i-9] + SIG0(w[i-15]) + w[i-16];
-
-    a=ctx->state[0]; b=ctx->state[1]; c=ctx->state[2]; d=ctx->state[3];
-    e=ctx->state[4]; f=ctx->state[5]; g=ctx->state[6]; h=ctx->state[7];
-
+    for (i = 0; i < 16; ++i)
+        w[i] = ((uint32_t)block[i*4] << 24) | ((uint32_t)block[i*4+1] << 16) |
+               ((uint32_t)block[i*4+2] << 8) | (uint32_t)block[i*4+3];
+    for (; i < 64; ++i) w[i] = SHA256_SIG1(w[i-14]) + w[i-9] + SHA256_SIG0(w[i-15]) + w[i-16];
+    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2]; d = ctx->state[3];
+    e = ctx->state[4]; f = ctx->state[5]; g = ctx->state[6]; h = ctx->state[7];
     for (i = 0; i < 64; ++i) {
-        t1 = h + EP1(e) + CH(e,f,g) + K[i] + w[i];
-        t2 = EP0(a) + MAJ(a,b,c);
-        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        t1 = h + SHA256_EP1(e) + SHA256_CH(e,f,g) + K[i] + w[i];
+        t2 = SHA256_EP0(a) + SHA256_MAJ(a,b,c);
+        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
-    ctx->state[0]+=a; ctx->state[1]+=b; ctx->state[2]+=c; ctx->state[3]+=d;
-    ctx->state[4]+=e; ctx->state[5]+=f; ctx->state[6]+=g; ctx->state[7]+=h;
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
 }
 
 void udplib_sha256_init(udplib_sha256_ctx* ctx) {
-    ctx->state[0]=0x6a09e667u; ctx->state[1]=0xbb67ae85u; ctx->state[2]=0x3c6ef372u;
-    ctx->state[3]=0xa54ff53au; ctx->state[4]=0x510e527fu; ctx->state[5]=0x9b05688cu;
-    ctx->state[6]=0x1f83d9abu; ctx->state[7]=0x5be0cd19u;
-    ctx->bitlen = 0; ctx->buflen = 0;
+    ctx->state[0] = 0x6a09e667u; ctx->state[1] = 0xbb67ae85u; ctx->state[2] = 0x3c6ef372u;
+    ctx->state[3] = 0xa54ff53au; ctx->state[4] = 0x510e527fu; ctx->state[5] = 0x9b05688cu;
+    ctx->state[6] = 0x1f83d9abu; ctx->state[7] = 0x5be0cd19u;
+    ctx->total = 0; ctx->datalen = 0;
 }
 
 void udplib_sha256_update(udplib_sha256_ctx* ctx, const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
+    ctx->total += len;
     while (len > 0) {
-        size_t take = 64 - ctx->buflen;
+        size_t take = 64 - ctx->datalen;
         if (take > len) take = len;
-        memcpy(ctx->buffer + ctx->buflen, p, take);
-        ctx->buflen += take;
-        p += take;
-        len -= take;
-        ctx->bitlen += (uint64_t)take * 8u;
-        if (ctx->buflen == 64) {
-            sha256_transform(ctx, ctx->buffer);
-            ctx->buflen = 0;
-        }
+        memcpy(ctx->buffer + ctx->datalen, p, take);
+        ctx->datalen += take; p += take; len -= take;
+        if (ctx->datalen == 64) { transform(ctx, ctx->buffer); ctx->datalen = 0; }
     }
 }
 
 void udplib_sha256_final(udplib_sha256_ctx* ctx, uint8_t out[32]) {
-    uint64_t bitlen = ctx->bitlen;   /* длина сообщения ДО паддинга */
-    uint8_t pad = 0x80;
-    uint8_t zeros[72];
+    uint64_t msg_bits = ctx->total * 8u;
+    static const uint8_t one = 0x80, zero = 0;
     uint8_t tail[8];
     int i;
-    memset(zeros, 0, sizeof(zeros));
-
-    udplib_sha256_update(ctx, &pad, 1);
-    {   /* нулями до позиции 56 (mod 64) */
-        size_t need = (size_t)((56 - ctx->buflen + 64) % 64);
-        if (need) udplib_sha256_update(ctx, zeros, need);
-    }
-    for (i = 0; i < 8; ++i) tail[i] = (uint8_t)(bitlen >> (56 - 8 * i));
+    udplib_sha256_update(ctx, &one, 1);
+    while (ctx->datalen != 56) udplib_sha256_update(ctx, &zero, 1);
+    for (i = 0; i < 8; ++i) tail[i] = (uint8_t)(msg_bits >> (56 - 8 * i));
     udplib_sha256_update(ctx, tail, 8);
-
     for (i = 0; i < 8; ++i) {
         out[i*4+0] = (uint8_t)(ctx->state[i] >> 24);
         out[i*4+1] = (uint8_t)(ctx->state[i] >> 16);
         out[i*4+2] = (uint8_t)(ctx->state[i] >> 8);
         out[i*4+3] = (uint8_t)(ctx->state[i]);
     }
+    ctx->total = 0;
 }
 
 static char hexchar(unsigned v) { return (char)(v < 10 ? '0' + v : 'a' + (v - 10)); }

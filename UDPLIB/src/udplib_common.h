@@ -9,7 +9,7 @@
 #include <stddef.h>
 
 /* magic в начале каждого пакета чистой UDP-фазы */
-#define UDPLIB_MAGIC    0x504C4455u   /* bytes 'U','D','P','L' little-endian */
+#define UDPLIB_MAGIC    0x4C504455u   /* bytes 'U','D','P','L' little-endian */
 #define UDPLIB_PROTOCOL 1u
 
 /* ---------- встроенный UDP-сервер для чистых UDP-клиентов ---------- */

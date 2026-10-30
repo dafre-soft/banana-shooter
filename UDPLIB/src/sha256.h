@@ -11,9 +11,9 @@ extern "C" {
 
 typedef struct {
     uint32_t state[8];
-    uint64_t bitlen;
+    uint64_t total;    /* всего байт передано через update                   */
     uint8_t  buffer[64];
-    size_t   buflen;
+    size_t   datalen;  /* байт в текущем незавершённом блоке                */
 } udplib_sha256_ctx;
 
 void udplib_sha256_init(udplib_sha256_ctx* ctx);
