@@ -109,40 +109,76 @@ build_tests() {
         "$TEST/sha_test.c" "$SRC/sha256.c"
     "$BUILD/sha_test"
 
-    echo "--- [test] protocol host (libudplib + client smoke) ---"
-    g++ "${CXXFLAGS[@]}" -o "$BUILD/host_main" "$TEST/host_main.cpp" \
-        "${LIB_SOURCES[@]}" -lpthread -fsanitize=address,undefined
-    g++ -O2 -std=c++17 -Wall -Wextra -o "$BUILD/udp_client" "$TEST/udp_client.cpp" "${DEFINES[@]}"
-    LD_PRELOAD="$BUILD/libudplib_asan.so" true  # no-op, чтобы set -e не спотыкалось
+    echo "--- [test] protocol host + clean UDP client smoke ---"
+    # стенд хоста и чистый клиент собираются БЕЗ asan (asan-либы нельзя
+    # грузить через dlopen в неинструментированный процесс); сам код общий.
+    g++ "${CXXFLAGS[@]}" -DUDPLIB_NO_AUTOINIT -I"$SRC" -o "$BUILD/host_main" "$TEST/host_main.cpp" \
+        "${LIB_SOURCES[@]}" -lpthread
+    g++ -O2 -std=c++17 -Wall -Wextra -I"$SRC" -o "$BUILD/udp_client" \
+        "$TEST/udp_client.cpp" "${DEFINES[@]}"
+
+    local tport=$((UDP_PORT + 30000))
+    [[ $tport -gt 65534 ]] && tport=29999
+    "$BUILD/host_main" --udp "$tport" --tcp 0 --seconds 8 >"$BUILD/host_test.log" 2>&1 &
+    local hostpid=$!
+    sleep 1
+    if ! kill -0 "$hostpid" 2>/dev/null; then
+        echo "[FAIL] host_main exited early:"; cat "$BUILD/host_test.log"; return 1
+    fi
+    local fail=0
+    # 1) неверный пароль должен быть отвергнут (защита паролем)
+    if "$BUILD/udp_client" 127.0.0.1 "wrong-password" --udp "$tport" \
+            >"$BUILD/client_badpw.log" 2>&1; then
+        echo "[FAIL] AUTH with wrong password SUCCEEDED"; fail=1
+    else
+        echo "[ok] wrong password rejected"
+    fi
+    # 2) верный пароль: полный цикл PING/HANDSHAKE/AUTH/STATUS/EVENT
+    if ! "$BUILD/udp_client" 127.0.0.1 "${UDPLIB_PASSWORD:-changeme}" --udp "$tport" \
+            --cmd "udplib" >"$BUILD/client_ok.log" 2>&1; then
+        echo "[FAIL] authenticated client cycle"; fail=1
+    else
+        echo "[ok] authenticated client cycle"
+    fi
+    kill -TERM "$hostpid" 2>/dev/null || true
+    wait "$hostpid" 2>/dev/null || true
+    echo "--- host log ---"; cat "$BUILD/host_test.log"
+    echo "--- client(bad pw) ---"; cat "$BUILD/client_badpw.log"
+    echo "--- client(ok) ---"; cat "$BUILD/client_ok.log"
+    grep -q "Build ${BUILD_NUM} from" "$BUILD/host_test.log" || {
+        echo "[FAIL] banner missing build number in host log"; fail=1; }
+    grep -q "EVENT" "$BUILD/client_ok.log" || {
+        echo "[FAIL] no EVENT received by client"; fail=1; }
+    [[ $fail -eq 0 ]] && echo "--- [test] PROTOCOL SMOKE: ALL PASS ---" || return 1
 }
 
 build_linux_lib() {
     echo "--- [linux] libudplib.so ---"
     gcc -O2 -Wall -Wextra -fPIC -c "$SRC/sha256.c" -o "$BUILD/sha256.o" "${DEFINES[@]}"
-    g++ "${CXXFLAGS[@]}" -shared -o "$DIST/libudplib.so" \
+    g++ "${CXXFLAGS[@]}" -I"$SRC" -shared -o "$DIST/libudplib.so" \
         "$SRC/udplib_api.cpp" "$SRC/udplib_server.cpp" "$BUILD/sha256.o" -lpthread
-    cp "$DIST/libudplib.so" "$BUILD/libudplib_asan.so"
     echo "    -> $DIST/libudplib.so"
 }
 
 build_linux_prepatcher() {
     echo "--- [linux] prepatcher (ELF) ---"
-    gcc -O2 -Wall -Wextra -o "$DIST/prepatcher" "${PREP_SOURCES[@]}"
+    gcc -O2 -Wall -Wextra -I"$SRC" -o "$DIST/prepatcher" "${PREP_SOURCES[@]}"
     echo "    -> $DIST/prepatcher"
 }
 
 build_windows_lib() {
     echo "--- [windows] udplib.dll (mingw posix-threads) ---"
-    x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -c "$SRC/sha256.c" -o "$BUILD/sha256.obj" "${DEFINES[@]}"
-    x86_64-w64-mingw32-g++-posix "${CXXFLAGS[@]}" -shared -static -static-libgcc -static-libstdc++ \
+    x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -I"$SRC" -c "$SRC/sha256.c" \
+        -o "$BUILD/sha256.obj" "${DEFINES[@]}"
+    x86_64-w64-mingw32-g++-posix "${CXXFLAGS[@]}" -I"$SRC" -shared -static -static-libgcc -static-libstdc++ \
         -o "$DIST/udplib.dll" "$SRC/udplib_api.cpp" "$SRC/udplib_server.cpp" "$BUILD/sha256.obj" -lws2_32 -m64
     echo "    -> $DIST/udplib.dll"
 }
 
 build_windows_prepatcher() {
     echo "--- [windows] prepatcher.exe ---"
-    x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -m64 -o "$DIST/prepatcher.exe" \
-        "${PREP_SOURCES[@]}" -static
+    x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -m64 -I"$SRC" -static -o "$DIST/prepatcher.exe" \
+        "${PREP_SOURCES[@]}"
     echo "    -> $DIST/prepatcher.exe"
 }
 

@@ -16,7 +16,9 @@ extern "C" {
 UDPLIB_API int udplib_init(unsigned udp_port, unsigned tcp_port) {
     if (g_active) return 1;                        /* идемпотентно */
     uint16_t u = (udp_port == 0 || udp_port > 65535u) ? (uint16_t)UDPLIB_UDP_PORT : (uint16_t)udp_port;
-    uint16_t t = (tcp_port  == 0 || tcp_port  > 65535u) ? (uint16_t)UDPLIB_TCP_PORT : (uint16_t)tcp_port;
+    // tcp_port == 0 ЯВНО означает "не поднимать TCP-консоль"
+    // (нужно для тестов и окружений без возможности слушать второй порт).
+    uint16_t t = (tcp_port > 65535u) ? (uint16_t)UDPLIB_TCP_PORT : (uint16_t)tcp_port;
     if (!udplib::Server::Instance().Start(u, t)) return 0;
     g_active = 1;
     printf("[udplib] active: %s, %s, udp=%u tcp=%u\n",

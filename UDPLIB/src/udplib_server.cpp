@@ -87,7 +87,7 @@ Server::~Server() { Stop(); }
 bool Server::Start(uint16_t udp_port, uint16_t tcp_port) {
     if (running_.load()) return true;           /* идемпотентность */
     if (udp_port == 0) udp_port = UDPLIB_UDP_PORT;
-    if (tcp_port == 0) tcp_port = UDPLIB_TCP_PORT;
+    // tcp_port == 0 -> TCP-консоль НЕ поднимается (явный выключатель)
 
     if (!winsock_init()) return false;
 
@@ -106,6 +106,8 @@ bool Server::Start(uint16_t udp_port, uint16_t tcp_port) {
         closesock(udp_sock_); udp_sock_ = UDPLIB_INVALID_SOCKET; winsock_cleanup(); return false;
     }
 
+    tcp_sock_ = UDPLIB_INVALID_SOCKET;
+    if (tcp_port != 0)
     tcp_sock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (tcp_sock_ != UDPLIB_INVALID_SOCKET) {
         int one = 1;
@@ -276,6 +278,17 @@ void Server::HandleUdpPacket(udplib_socket_t sock, const uint8_t* data, size_t l
             c->authed = false;
             SendPacket(sock, (uint8_t)UDPLIB_UDP_ERROR, seq, "invalid password", from);
         }
+        return;
+    }
+
+    case UDPLIB_UDP_STATUS: {
+        ExpireClients();
+        UdpClient* c = TouchClient(ipbuf, sport);
+        if (!c || !c->authed) {
+            SendPacket(sock, (uint8_t)UDPLIB_UDP_ERROR, seq, "unauthorized: auth required", from);
+            return;
+        }
+        SendPacket(sock, (uint8_t)UDPLIB_UDP_STATUS, seq, StatusJson(), from);
         return;
     }
 
