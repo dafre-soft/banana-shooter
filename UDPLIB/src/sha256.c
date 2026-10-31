@@ -31,7 +31,8 @@ static void transform(udplib_sha256_ctx* ctx, const uint8_t block[64]) {
     for (i = 0; i < 16; ++i)
         w[i] = ((uint32_t)block[i*4] << 24) | ((uint32_t)block[i*4+1] << 16) |
                ((uint32_t)block[i*4+2] << 8) | (uint32_t)block[i*4+3];
-    for (; i < 64; ++i) w[i] = SHA256_SIG1(w[i-14]) + w[i-9] + SHA256_SIG0(w[i-15]) + w[i-16];
+    for (; i < 64; ++i)
+        w[i] = SHA256_SIG1(w[i-2]) + w[i-7] + SHA256_SIG0(w[i-15]) + w[i-16];
     a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2]; d = ctx->state[3];
     e = ctx->state[4]; f = ctx->state[5]; g = ctx->state[6]; h = ctx->state[7];
     for (i = 0; i < 64; ++i) {
@@ -52,22 +53,26 @@ void udplib_sha256_init(udplib_sha256_ctx* ctx) {
 
 void udplib_sha256_update(udplib_sha256_ctx* ctx, const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
-    ctx->total += len;
+    /* total считает ВСЕ байты исходного сообщения (включая padding,
+       добавленный final() через этот же update). Инкремент — до
+       обработки блока, иначе длина считается неверно. */
     while (len > 0) {
         size_t take = 64 - ctx->datalen;
         if (take > len) take = len;
         memcpy(ctx->buffer + ctx->datalen, p, take);
         ctx->datalen += take; p += take; len -= take;
+        ctx->total += take;
         if (ctx->datalen == 64) { transform(ctx, ctx->buffer); ctx->datalen = 0; }
     }
 }
 
 void udplib_sha256_final(udplib_sha256_ctx* ctx, uint8_t out[32]) {
-    uint64_t msg_bits = ctx->total * 8u;
-    static const uint8_t one = 0x80, zero = 0;
+    uint64_t msg_bits = ctx->total * 8u;   /* длина ДО начала padding */
+    static const uint8_t pad = 0x80;
+    static const uint8_t zero = 0x00;
     uint8_t tail[8];
     int i;
-    udplib_sha256_update(ctx, &one, 1);
+    udplib_sha256_update(ctx, &pad, 1);
     while (ctx->datalen != 56) udplib_sha256_update(ctx, &zero, 1);
     for (i = 0; i < 8; ++i) tail[i] = (uint8_t)(msg_bits >> (56 - 8 * i));
     udplib_sha256_update(ctx, tail, 8);
@@ -77,7 +82,6 @@ void udplib_sha256_final(udplib_sha256_ctx* ctx, uint8_t out[32]) {
         out[i*4+2] = (uint8_t)(ctx->state[i] >> 8);
         out[i*4+3] = (uint8_t)(ctx->state[i]);
     }
-    ctx->total = 0;
 }
 
 static char hexchar(unsigned v) { return (char)(v < 10 ? '0' + v : 'a' + (v - 10)); }

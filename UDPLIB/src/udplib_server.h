@@ -1,5 +1,17 @@
+/* ============================================================
+ *  udplib_server.h - внутренний интерфейс встроенного сервера.
+ *  UDP: чистые клиенты; TCP: telnet-консоль администратора.
+ * ============================================================ */
 #ifndef UDPLIB_SERVER_H_
 #define UDPLIB_SERVER_H_
+
+#if defined(_WIN32)
+  /* winsock2.h ОБЯЗАТЕЛЬНО раньше std-заголовков, иначе mingw ломает
+     std::mutex/std::thread из-за конфликта windows.h */
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -11,8 +23,6 @@
 #include "udplib_common.h"
 
 #if defined(_WIN32)
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
   typedef SOCKET udplib_socket_t;
   #define UDPLIB_INVALID_SOCKET INVALID_SOCKET
   #define UDPLIB_SOCKET_ERROR   SOCKET_ERROR
@@ -21,12 +31,19 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+  #include <sys/select.h>
+  #include <sys/types.h>
   typedef int udplib_socket_t;
   #define UDPLIB_INVALID_SOCKET (-1)
   #define UDPLIB_SOCKET_ERROR   (-1)
 #endif
 
 namespace udplib {
+
+/* неактивный клиент вычищается через это время без пакетов */
+#ifndef UDPLIB_CLIENT_TIMEOUT_MS
+#define UDPLIB_CLIENT_TIMEOUT_MS 30000u
+#endif
 
 struct UdpClient {
     bool active = false;
@@ -57,14 +74,21 @@ private:
 
     void UdpLoop(uint16_t port);
     void TcpLoop(uint16_t port);
-    void HandleUdpPacket(udplib_socket_t sock, const uint8_t* data, size_t len,
-                         const struct sockaddr_in& from);
-    void SendTo(udplib_socket_t sock, const uint8_t* buf, size_t len,
-                const struct sockaddr_in& to);
-    void HandleTcpLine(std::string line, const std::string& peer,
+
+    void HandleUdpPacket(udplib_socket_t sock, const uint8_t* data, size_t len, const sockaddr_in& from);
+    void SendPacket(udplib_socket_t sock, uint8_t type, uint16_t seq,
+                    const std::string& body, const sockaddr_in& to);
+
+    UdpClient* TouchClient(const std::string& ip, uint16_t port);
+    UdpClient* FindClientLocked(const std::string& ip, uint16_t port);
+    void ExpireClients();
+
+    void HandleTcpLine(const std::string& line, const std::string& peer,
                        bool& authed, std::string& reply);
 
     std::atomic<bool> running_{false};
+    std::atomic<udplib_socket_t> live_udp_sock_{UDPLIB_INVALID_SOCKET};
+    std::atomic<udplib_socket_t> live_tcp_sock_{UDPLIB_INVALID_SOCKET};
     std::thread udp_thread_, tcp_thread_;
     udplib_socket_t udp_sock_ = UDPLIB_INVALID_SOCKET;
     udplib_socket_t tcp_sock_ = UDPLIB_INVALID_SOCKET;
