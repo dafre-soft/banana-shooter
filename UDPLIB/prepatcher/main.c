@@ -174,6 +174,7 @@ static uint64_t rd64(const unsigned char* p) {
 static void w32(unsigned char* p, uint32_t v) {
     p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
 }
+static void w16(unsigned char* p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
 static void w64(unsigned char* p, uint64_t v) { w32(p, (uint32_t)v); w32(p + 4, (uint32_t)(v >> 32)); }
 
 static int ci_cmp(const char* a, const char* b) {
@@ -252,25 +253,40 @@ static int elf64_find_sec(const unsigned char* d, long size, const char* name, l
     return -1;
 }
 
-static int elf_add_dt_needed(unsigned char* data, long size, const char* libname, int dry) {
+/* Инъекция DT_NEEDED в ELF64. Возможны два режима:
+ *  A) in-place: строка уже есть в .dynstr (или найден нулевой pad внутри
+ *     неё), плюс свободный слот (pad до DT_NULL или хвост PT_DYNAMIC) -
+ *     файл НЕ меняет размер;
+ *  B) growth: строки нет и pad'а нет - добавляем новую PT_LOAD-сегмент
+ *     в конец файла (.dynstr + расширенная .dynamic со старыми entry +
+ *     новый DT_NEEDED + DT_NULL). e_phnum растёт на 1 (для этого в конце
+ *     сегмента заголовков резервируется один NULL-слот); если его нет -
+ *     используется расширение таблицы сегментов с сдвигом данных и
+ *     пересчётом всех файловых смещений. */
+static int elf_add_dt_needed(const char* path, unsigned char** pdata, long* psize,
+                             const char* libname, int dry) {
+    unsigned char* data = *pdata;
+    long size = *psize;
     long dyn = 0, dynsz = 0;
     long p, last_entry = -1, zero_entry = -1;
     long str_off = 0, str_sz = 0;
     uint64_t val;
-    long free_at = -1;                 /* куда пишем строку внутри pad .dynstr */
+    long free_at = -1;
     long str_val = -1;
+    long need = (long)strlen(libname) + 1;
+    long str_pad_run = 0, str_pad_start = -1, q;
+    long dyn_pad;
+    uint64_t phoff, shoff;
+    uint16_t phes, phn, shes, shn, i;
 
-    if (elf_find(data, size, libname, &dyn)) { } else return -1;
-    {
-        uint64_t phoff = rd64(data + 32);
-        uint16_t phes = rd16(data + 54), phn = rd16(data + 56);
-        uint16_t i;
-        for (i = 0; i < phn; ++i) {
-            long q = (long)(phoff + (uint64_t)i * phes);
-            if (rd32(data + q) == 2) { dynsz = (long)rd64(data + q + 32); break; }
-        }
+    if (!elf_find(data, size, libname, &dyn)) return -1;   /* не ELF64 */
+    phoff = rd64(data + 32);
+    phes = rd16(data + 54); phn = rd16(data + 56);
+    for (i = 0; i < phn; ++i) {
+        long ph = (long)(phoff + (uint64_t)i * phes);
+        if (rd32(data + ph) == 2) { dyn = (long)rd64(data + ph + 8); dynsz = (long)rd64(data + ph + 32); break; }
     }
-    if (dynsz <= 0) return -1;
+    if (dynsz <= 0) { fprintf(stderr, "inject ELF: no PT_DYNAMIC\n"); return -1; }
 
     for (p = dyn; p + 16 <= dyn + dynsz; p += 16) {
         uint64_t tag = rd64(data + p);
@@ -280,63 +296,189 @@ static int elf_add_dt_needed(unsigned char* data, long size, const char* libname
     if (zero_entry < 0) { fprintf(stderr, "inject ELF: no DT_NULL\n"); return -1; }
 
     if (elf64_find_sec(data, size, ".dynstr", &str_off, &str_sz) != 0) {
-        fprintf(stderr, "inject ELF: cannot find .dynstr via section table\n"); return -1;
+        fprintf(stderr, "inject ELF: cannot find .dynstr\n"); return -1;
     }
 
     /* дубликат? */
     for (p = dyn; p <= zero_entry; p += 16) {
-        uint64_t tag = rd64(data + p);
         val = rd64(data + p + 8);
-        if (tag == 1 && (long)val < str_sz && strcmp((const char*)data + str_off + val, libname) == 0) {
+        if (rd64(data + p) == 1 && (long)val < str_sz &&
+            strcmp((const char*)data + str_off + val, libname) == 0) {
             printf("inject: DT_NEEDED '%s' already present\n", libname);
             return 2;
         }
     }
 
-    /* строка: ищем готовую в .dynstr, иначе пишем в нулевой pad таблицы строк */
-    {
-        long de;
-        for (de = str_off; de + (long)strlen(libname) < str_off + str_sz; ++de) {
-            if (memcmp(data + de, libname, strlen(libname)) == 0 &&
-                (de == str_off || data[de-1] == 0) && data[de + strlen(libname)] == 0) {
-                str_val = de - str_off; break;
-            }
+    /* строка уже есть в .dynstr? */
+    for (q = str_off; q + need < str_off + str_sz; ++q) {
+        if (memcmp(data + q, libname, (size_t)need) == 0 && (q == str_off || data[q-1] == 0)) {
+            str_val = q - str_off; break;
         }
-    }
-    if (str_val < 0) {
-        long run = 0, start = -1, q;
-        for (q = str_off; q < str_off + str_sz; ++q) {
-            if (data[q] == 0) {
-                if (run < 0) run = 0;
-                ++run;
-                if (run >= (long)strlen(libname) + 1) { start = q - run + 1; break; }
-            } else run = -1;
-        }
-        if (start < 0) { fprintf(stderr, "inject ELF: no room in .dynstr\n"); return -1; }
-        memcpy(data + start, libname, strlen(libname));
-        data[start + strlen(libname)] = 0;
-        str_val = start - str_off;
     }
 
-    /* слот под новый DT_NEEDED */
-    {
-        long pad = zero_entry - (last_entry + 16);
-        if (pad >= 16) {
+    /* нулевой pad ВНУТРИ sh_size(.dynstr) */
+    for (q = str_off + str_sz; q > str_off; ) {
+        --q;
+        if (data[q] == 0) { ++str_pad_run; if (str_pad_start < 0) str_pad_start = q; }
+        else break;
+    }
+    if (str_val < 0 && str_pad_run >= need) {
+        memcpy(data + str_pad_start, libname, (size_t)(need - 1));
+        data[str_pad_start + need - 1] = 0;
+        str_val = str_pad_start - str_off;
+    }
+
+    dyn_pad = zero_entry - (last_entry + 16);
+
+    if (str_val >= 0) {
+        /* --- режим A: in-place --- */
+        if (dyn_pad >= 16) {
             free_at = last_entry + 16;
-        } else {
-            long tail_len = (dyn + dynsz) - zero_entry;     /* DT_NULL + pad хвоста */
-            if (tail_len < 0 || tail_len + 16 > dynsz) { fprintf(stderr, "inject ELF: no room in .dynamic\n"); return -1; }
-            memmove(data + zero_entry + 16, data + zero_entry, (size_t)tail_len);
-            memset(data + zero_entry, 0, 16);
+        } else if (zero_entry + 16 <= dyn + dynsz) {
+            memmove(data + zero_entry + 16, data + zero_entry, (size_t)((dyn + dynsz) - zero_entry));
             free_at = zero_entry;
+        } else {
+            fprintf(stderr, "inject ELF: no room in .dynamic\n"); return -1;
+        }
+        w64(data + free_at, 1);
+        w64(data + free_at + 8, (uint64_t)str_val);
+        printf("inject ELF: added DT_NEEDED '%s' (stroff=%ld slot=0x%lx, in-place)%s\n",
+               libname, str_val, (unsigned long)free_at, dry ? " [dry-run]" : "");
+        if (dry) return 0;
+        {
+            FILE* fw = fopen(path, "r+b");
+            if (!fw) { perror(path); return 1; }
+            if (fwrite(data, 1, (size_t)size, fw) != (size_t)size) { perror("write"); fclose(fw); return 1; }
+            fclose(fw);
+        }
+        return 0;
+    }
+
+    /* --- режим B: новый PT_LOAD в конце файла (строка + мини-.dynamic) --- */
+    {
+        long new_dynsz = 32;                            /* DT_NEEDED + DT_NULL */
+        long align = 0x1000;
+        long seg_off = (size + align - 1) / align * align;
+        long str_new_off, dyn_new_off;
+        long seg_filesz = need + new_dynsz;
+        uint64_t last_vaddr = 0, last_poff = 0, last_psz = 0, last_memsz = 0;
+        long new_vaddr;
+        int have_ph_free = 0;
+        long hdr_end;
+        long delta;
+
+        for (i = 0; i < phn; ++i) {
+            long ph = (long)(phoff + (uint64_t)i * phes);
+            if (rd32(data + ph) == 1) {
+                last_poff  = rd64(data + ph + 8);
+                last_vaddr = rd64(data + ph + 16);
+                last_psz   = rd64(data + ph + 32);
+                last_memsz = rd64(data + ph + 40);
+            }
+        }
+        if (last_psz == 0) { fprintf(stderr, "inject ELF: no PT_LOAD found\n"); return -1; }
+        new_vaddr = (long)last_vaddr + (long)last_memsz;
+        new_vaddr = (new_vaddr + (align - 1)) & ~(long)(align - 1);
+
+        hdr_end = (long)(phoff + (uint64_t)phn * phes);
+        if (hdr_end + phes <= (long)last_poff + (long)last_psz) {
+            int allzero = 1;
+            for (q = hdr_end; q < hdr_end + phes; ++q) if (data[q]) { allzero = 0; break; }
+            if (allzero) have_ph_free = 1;
+        }
+
+        if (have_ph_free) {
+            delta = seg_off - size;
+        } else {
+            delta = (long)phes + seg_off - size;
+            seg_off += phes;
+        }
+        str_new_off = seg_off;
+        dyn_new_off = seg_off + need;
+
+        if (dry) {
+            printf("inject ELF: would add DT_NEEDED '%s' via new PT_LOAD (%s), file grows by %ld bytes\n",
+                   libname, have_ph_free ? "phnum reserve" : "phdr table grow",
+                   seg_off + seg_filesz - size);
+            return 0;
+        }
+
+        {
+            long newsize = seg_off + seg_filesz;
+            unsigned char* nd = realloc(data, (size_t)newsize);
+            long ph;
+            long old_end = have_ph_free ? seg_off : (seg_off - phes);
+            if (!nd) { fprintf(stderr, "inject ELF: OOM\n"); return 1; }
+            data = nd; *pdata = nd;
+            memset(data + size, 0, (size_t)(newsize - size));
+
+            if (!have_ph_free) {
+                memmove(data + hdr_end + phes, data + hdr_end, (size_t)(old_end - hdr_end));
+                memset(data + hdr_end, 0, (size_t)phes);
+            }
+
+            memcpy(data + str_new_off, libname, (size_t)(need - 1));
+            data[str_new_off + need - 1] = 0;
+            w64(data + dyn_new_off, 1);
+            w64(data + dyn_new_off + 8, (uint64_t)need);
+            w64(data + dyn_new_off + 16, 0);
+            w64(data + dyn_new_off + 24, 0);
+
+            /* заполняем первые два свободных слота таблицы сегментов:
+               - если был резерв linker'а - пишем с hdr_end;
+               - иначе мы сдвинули таблицу на +phes и освободили hdr_end,
+                 второй слот - конец сдвинутой таблицы (hdr_end+phes). */
+            ph = hdr_end;
+            if (!have_ph_free) { /* слоты: [hdr_end] пустой + старые после него; второй новый - после таблицы */ }
+            {
+                long ph2 = have_ph_free ? (hdr_end + phes) : (hdr_end + (long)phes * 2);
+                w32(data + ph + 0, 2);                    /* PT_DYNAMIC */
+                w32(data + ph + 4, 6);                    /* RW */
+                w64(data + ph + 8,  (uint64_t)dyn_new_off);
+                w64(data + ph + 16, (uint64_t)(new_vaddr + need));
+                w64(data + ph + 24, (uint64_t)(new_vaddr + need));
+                w64(data + ph + 32, (uint64_t)new_dynsz);
+                w64(data + ph + 40, (uint64_t)new_dynsz);
+                w64(data + ph + 48, 8);
+                w32(data + ph2 + 0, 1);                   /* PT_LOAD */
+                w32(data + ph2 + 4, 6);                   /* RW */
+                w64(data + ph2 + 8,  (uint64_t)seg_off);
+                w64(data + ph2 + 16, (uint64_t)new_vaddr);
+                w64(data + ph2 + 24, (uint64_t)new_vaddr);
+                w64(data + ph2 + 32, (uint64_t)seg_filesz);
+                w64(data + ph2 + 40, (uint64_t)seg_filesz);
+                w64(data + ph2 + 48, (uint64_t)align);
+            }
+            w16(data + 56, phn + 2);                      /* e_phnum += 2 */
+
+            /* сдвиг файловых смещений старых областей */
+            shoff = rd64(data + 40);
+            if ((long)shoff >= old_end) w64(data + 40, (uint64_t)(shoff + delta));
+            for (i = 0; i < phn; ++i) {
+                long tph = (long)(phoff + (uint64_t)i * phes);
+                long o = (long)rd64(data + tph + 8);
+                if (o >= old_end) w64(data + tph + 8, (uint64_t)(o + delta));
+            }
+            shes = rd16(data + 58); shn = rd16(data + 60);
+            for (i = 0; i < shn; ++i) {
+                long s = (long)(shoff + (long)i * shes);
+                long o = (long)rd64(data + s + 24);
+                if (o >= old_end) w64(data + s + 24, (uint64_t)(o + delta));
+            }
+            *psize = newsize;
+
+            {
+                FILE* fw = fopen(path, "wb");
+                if (!fw) { perror(path); return 1; }
+                if (fwrite(data, 1, (size_t)newsize, fw) != (size_t)newsize) { perror("write"); fclose(fw); return 1; }
+                fclose(fw);
+            }
+            printf("inject ELF: added DT_NEEDED '%s' (new PT_LOAD at 0x%lx vaddr 0x%lx, %s)\n",
+                   libname, (unsigned long)seg_off, (unsigned long)new_vaddr,
+                   have_ph_free ? "phnum reserve" : "phdr table grow");
+            return 0;
         }
     }
-    w64(data + free_at, 1);                    /* DT_NEEDED */
-    w64(data + free_at + 8, (uint64_t)str_val);
-    printf("inject ELF: added DT_NEEDED '%s' (stroff=%ld slot=0x%lx)%s\n",
-           libname, str_val, (unsigned long)free_at, dry ? " [dry-run]" : "");
-    if (dry) return 0;
-    return 0;
 }
 
 static int cmd_inject(const char* path, const char* libname, int dry) {
@@ -358,19 +500,11 @@ static int cmd_inject(const char* path, const char* libname, int dry) {
         if (elf_find(data, size, libname, &dyn)) {
             int erc;
             (void)dyn;
-            erc = elf_add_dt_needed(data, size, libname, dry);
-            if (erc == 0) {
-                if (!dry) {
-                    FILE* fw = fopen(path, "r+b");
-                    if (!fw) { perror(path); goto out; }
-                    if (fwrite(data, 1, (size_t)size, fw) != (size_t)size) { perror("write"); fclose(fw); goto out; }
-                    fclose(fw);
-                    printf("injected OK: %s -> %s\n", path, libname);
-                }
-                rc = 0; goto out;
-            } else if (erc == 2) { rc = 2; goto out; }
-            /* не ELF или ошибка - падаем дальше на проверку PE */
+            erc = elf_add_dt_needed(path, &data, &size, libname, dry);
+            if (erc == 0 || erc == 2) { rc = erc; goto out; }
+            /* ошибка -> падаем дальше на проверку PE */
         }
+    }
     /* ---------------- PE32+: импорт DLL ---------------- */
     if (size >= 0x40 && data[0] == 'M' && data[1] == 'Z') {
         uint32_t e_lfanew = rd32(data + 0x3C);
